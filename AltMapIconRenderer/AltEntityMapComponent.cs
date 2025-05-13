@@ -5,55 +5,137 @@ using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
+using System.Text;
 
 namespace AltMapIconRenderer;
 
 public class AltEntityMapComponent
 {
-	public static bool Render(EntityMapComponent __instance, GuiElementMap map, float dt)
-	{
-		Traverse traverse = Traverse.Create(__instance);
-		ICoreClientAPI coreClientAPI = traverse.Field("capi").GetValue() as ICoreClientAPI;
-		Entity entity = traverse.Field("entity").GetValue() as Entity;
-		MeshRef meshRef = traverse.Field("quadModel").GetValue() as MeshRef;
-		LoadedTexture loadedTexture = traverse.Field("Texture").GetValue() as LoadedTexture;
-		Vec2f viewPos = traverse.Field("viewPos").GetValue() as Vec2f;
-		Matrixf matrixf = traverse.Field("mvMat").GetValue() as Matrixf;
-		IPlayer player = (entity as EntityPlayer)?.Player;
-		if (player != null && player.WorldData?.CurrentGameMode == EnumGameMode.Spectator)
-		{
-			return false;
-		}
-		EntityPlayer obj = entity as EntityPlayer;
-		if (obj != null && obj.Controls.Sneak && player != coreClientAPI.World.Player)
-		{
-			return false;
-		}
-		map.TranslateWorldPosToViewPos(entity.Pos.XYZ, ref viewPos);
-		float x = (float)(map.Bounds.renderX + (double)viewPos.X);
-		float y = (float)(map.Bounds.renderY + (double)viewPos.Y);
-		ICoreClientAPI api = map.Api;
-		if (loadedTexture.Disposed)
-		{
-			throw new Exception("Fatal. Trying to render a disposed texture");
-		}
-		if (meshRef.Disposed)
-		{
-			throw new Exception("Fatal. Trying to render a disposed texture");
-		}
-		coreClientAPI.Render.GlToggleBlend(blend: true);
-		IShaderProgram engineShader = api.Render.GetEngineShader(EnumShaderProgram.Gui);
-		engineShader.Uniform("rgbaIn", AltMapIconRendererSystem.playerColour);
-		engineShader.Uniform("extraGlow", 0);
-		engineShader.Uniform("applyColor", 0);
-		engineShader.Uniform("noTexture", 0f);
-		engineShader.BindTexture2D("tex2d", loadedTexture.TextureId, 0);
-		matrixf.Set(api.Render.CurrentModelviewMatrix).Translate(x, y, 60f).Scale(loadedTexture.Width, loadedTexture.Height, 0f)
-			.Scale(0.75f, 0.75f, 0f)
-			.RotateZ(-entity.Pos.Yaw + (float)Math.PI);
-		engineShader.UniformMatrix("projectionMatrix", api.Render.CurrentProjectionMatrix);
-		engineShader.UniformMatrix("modelViewMatrix", matrixf.Values);
-		api.Render.RenderMesh(meshRef);
-		return false;
-	}
+    protected static Vec2f viewPos = new Vec2f();
+    protected static Matrixf outline = new Matrixf();
+
+    public static bool Render(EntityMapComponent __instance, GuiElementMap map, float dt)
+    {
+        Traverse self = Traverse.Create(__instance);
+        ICoreClientAPI capi = self.Field("capi").GetValue<ICoreClientAPI>();
+        Entity entity = self.Field("entity").GetValue<Entity>();
+        MeshRef quadModel = self.Field("quadModel").GetValue<MeshRef>();
+        LoadedTexture texture = self.Field("Texture").GetValue<LoadedTexture>();
+        Vec2f viewPos = self.Field("viewPos").GetValue<Vec2f>();
+        Matrixf mvMat = self.Field("mvMat").GetValue<Matrixf>();
+        var player = (entity as EntityPlayer)?.Player;
+
+        if (player?.WorldData?.CurrentGameMode == EnumGameMode.Spectator == true)
+            return false;
+
+        if ((entity as EntityPlayer)?.Controls.Sneak == true && player != capi.World.Player)
+            return false;
+
+        map.TranslateWorldPosToViewPos(entity.Pos.XYZ, ref viewPos);
+
+        if (AltMapIconRendererSystem.config.Get().pin_player_icons)
+        {
+            map.ClampButPreserveAngle(ref viewPos, 2);
+            map.Api.Render.PushScissor(null);
+        }
+        else
+        {
+            if (viewPos.X < -10 || viewPos.Y < -10 || viewPos.X > map.Bounds.OuterWidth + 10 || viewPos.Y > map.Bounds.OuterHeight + 10)
+                return false;
+        }
+
+        float x = (float)(map.Bounds.renderX + viewPos.X);
+        float y = (float)(map.Bounds.renderY + viewPos.Y);
+        float zoom = GameMath.Clamp(map.ZoomLevel, AltMapIconRendererSystem.zoomMin, AltMapIconRendererSystem.zoomMax);
+
+        if (texture?.Disposed == true)
+            throw new Exception("Fatal. Trying to render a disposed texture");
+        if (quadModel?.Disposed == true)
+            throw new Exception("Fatal. Trying to render a disposed mesh");
+
+        capi.Render.GlToggleBlend(true);
+
+        var prog = capi.Render.GetEngineShader(EnumShaderProgram.Gui);
+        bool mouseOver = self.Field("mouseOver").GetValue<bool>();
+
+        Vec4f outlineColor = mouseOver ? AltMapIconRendererSystem.rgbaHover : AltMapIconRendererSystem.rgbaOutline;
+        Vec4f iconColor = mouseOver ? AltMapIconRendererSystem.rgbaHover : AltMapIconRendererSystem.playerColour;
+
+        prog.Uniform("extraGlow", mouseOver ? 1 : 0);
+        prog.Uniform("applyColor", mouseOver? 1 : 0);
+        prog.Uniform("noTexture", 0f);
+        prog.UniformMatrix("projectionMatrix", capi.Render.CurrentProjectionMatrix);
+        prog.BindTexture2D("tex2d", texture.TextureId, 0);
+
+        mvMat.Set(capi.Render.CurrentModelviewMatrix)
+             .Translate(x, y, 60)
+             .Scale(texture.Width * zoom, texture.Height * zoom, 0)
+             .Scale(AltMapIconRendererSystem.playerScale, AltMapIconRendererSystem.playerScale, 0)
+             .RotateZ(-entity.Pos.Yaw + 180 * GameMath.DEG2RAD);
+
+        if (mouseOver)
+        {
+            float offset = AltMapIconRendererSystem.outlineOffset;
+            for (int oy = -1; oy <= 1; oy++)
+            {
+                for (int ox = -1; ox <= 1; ox++)
+                {
+                    if (ox == 0 && oy == 0) continue;
+
+                    outline.Set(mvMat.Values).Translate(offset * ox, offset * oy, 0);
+                    prog.Uniform("rgbaIn", AltMapIconRendererSystem.rgbaHover);
+                    prog.UniformMatrix("modelViewMatrix", outline.Values);
+                    capi.Render.RenderMesh(quadModel);
+                }
+            }
+        }
+
+        prog.Uniform("rgbaIn", iconColor);
+        prog.UniformMatrix("modelViewMatrix", mvMat.Values);
+        capi.Render.RenderMesh(quadModel);
+        if (AltMapIconRendererSystem.config.Get().pin_player_icons)
+        {
+            map.Api.Render.PopScissor();
+        }
+        return false;
+    }
+
+    public static bool OnMouseMove(EntityMapComponent __instance, MouseEvent args, GuiElementMap mapElem, StringBuilder hoverText)
+    {
+        var self = Traverse.Create(__instance);
+        var entity = self.Field("entity").GetValue<Entity>();
+        if (entity == null) return false;
+
+        var capi = self.Field("capi").GetValue<ICoreClientAPI>();
+
+        mapElem.TranslateWorldPosToViewPos(entity.Pos.XYZ, ref viewPos);
+
+        if (AltMapIconRendererSystem.config.Get().pin_player_icons)
+        {
+            mapElem.ClampButPreserveAngle(ref viewPos, 2);
+        }
+
+        float x = (float)(mapElem.Bounds.renderX + viewPos.X);
+        float y = (float)(mapElem.Bounds.renderY + viewPos.Y);
+
+        float hoverSize = (float)GuiElement.scaled(AltMapIconRendererSystem.hoverSize) *
+                          GameMath.Clamp(mapElem.ZoomLevel, AltMapIconRendererSystem.zoomMin, AltMapIconRendererSystem.zoomMax);
+
+        double dx = args.X - x;
+        double dy = args.Y - y;
+
+        bool mouseOver = Math.Abs(dx) < hoverSize && Math.Abs(dy) < hoverSize;
+        self.Field("mouseOver").SetValue(mouseOver);
+
+        if (mouseOver && entity is EntityPlayer eplayer)
+        {
+            var pos = entity.Pos.AsBlockPos;
+            var spawn = capi.World.DefaultSpawnPosition.AsBlockPos;
+            string name = eplayer.Player?.PlayerName ?? "Player";
+            hoverText.AppendLine(name);
+            hoverText.AppendLine($"{pos.X - spawn.X}, {pos.Y - spawn.Y}, {pos.Z - spawn.Z}");
+        }
+
+        return false;
+    }
 }
